@@ -199,20 +199,11 @@ public class TelegramBotController extends TelegramLongPollingBot {
         }
     }
 
-    private void sendResponse(String chatId, @NotNull BotService.BotResponse response, String originalMessage,User user) {
-        String text = response.getText();
 
+    private void sendResponse(String chatId, @NotNull BotService.BotResponse response, String originalMessage, User user) {
+        String text = response.getText();
         if (text == null || text.isEmpty()) {
             text = ERROR_MESSAGE;
-        }
-
-        ReplyKeyboard replyMarkup;
-        if (response.hasInlineKeyboard()) {
-            replyMarkup = response.getInlineKeyboard();
-        } else if (response.shouldRemoveReplyKeyboard()) {
-            replyMarkup = new ReplyKeyboardRemove(true);
-        } else {
-            replyMarkup = determineKeyboard(originalMessage, text, user);
         }
 
         boolean hasActualContent = !text.trim().isEmpty() && !text.equals(EMPTY_MESSAGE_TEXT);
@@ -220,17 +211,16 @@ public class TelegramBotController extends TelegramLongPollingBot {
         if (hasActualContent) {
             if (text.length() > BotConstants.MAX_MESSAGE_LENGTH) {
                 String[] messageParts = MessageUtils.splitLongMessage(text);
-
                 for (int i = 0; i < messageParts.length; i++) {
                     String messageText = messageParts[i];
                     if (messageText == null || messageText.isEmpty()) {
                         messageText = EMPTY_MESSAGE_TEXT;
                     }
-
                     SendMessage message = createMessage(chatId, messageText);
 
-                    if (i == messageParts.length - 1) {
-                        message.setReplyMarkup(replyMarkup);
+                    // К последнему сообщению добавляем inline-клавиатуру (если есть)
+                    if (i == messageParts.length - 1 && response.hasInlineKeyboard()) {
+                        message.setReplyMarkup(response.getInlineKeyboard());
                     }
 
                     try {
@@ -240,25 +230,57 @@ public class TelegramBotController extends TelegramLongPollingBot {
                     }
                 }
             } else {
-                SendMessage message = createMessage(chatId, text, replyMarkup);
-
+                // Отправляем основное сообщение с inline-клавиатурой (если есть)
+                ReplyKeyboard mainReplyMarkup = response.hasInlineKeyboard() ? response.getInlineKeyboard() : null;
+                SendMessage message = createMessage(chatId, text, mainReplyMarkup);
                 try {
                     execute(message);
                 } catch (TelegramApiException ignored) {
                     // Игнорируем ошибки отправки
                 }
             }
+
+            // Если есть Reply-клавиатура, отправляем её отдельным сообщением с точкой и удаляем
+            if (response.hasReplyKeyboard()) {
+                SendMessage replyMessage = new SendMessage();
+                replyMessage.setChatId(chatId);
+                replyMessage.setText("\n\nМеню для навигации ⬇️");
+                replyMessage.setReplyMarkup(response.getReplyKeyboard());
+
+                // Устанавливаем стандартные настройки для Reply-клавиатуры
+                if (response.getReplyKeyboard() instanceof ReplyKeyboardMarkup) {
+                    ((ReplyKeyboardMarkup) response.getReplyKeyboard()).setOneTimeKeyboard(false);
+                }
+
+                try {
+                    // Отправляем сообщение с Reply-клавиатурой
+                    execute(replyMessage);
+
+                } catch (TelegramApiException ignored) {
+
+                }
+            }
         } else {
+            // Если нет контента, определяем клавиатуру по старой логике
+            ReplyKeyboard replyMarkup;
+            if (response.hasInlineKeyboard()) {
+                replyMarkup = response.getInlineKeyboard();
+            } else if (response.shouldRemoveReplyKeyboard()) {
+                replyMarkup = new ReplyKeyboardRemove(true);
+            } else if (response.hasReplyKeyboard()) {
+                replyMarkup = response.getReplyKeyboard();
+            } else {
+                replyMarkup = determineKeyboard(originalMessage, text, user);
+            }
+
             if (replyMarkup != null) {
                 if (replyMarkup instanceof ReplyKeyboardMarkup) {
                     ((ReplyKeyboardMarkup) replyMarkup).setOneTimeKeyboard(false);
                 }
-
                 SendMessage keyboardMessage = new SendMessage();
                 keyboardMessage.setChatId(chatId);
                 keyboardMessage.setText(EMPTY_MESSAGE_TEXT);
                 keyboardMessage.setReplyMarkup(replyMarkup);
-
                 try {
                     execute(keyboardMessage);
                 } catch (TelegramApiException ignored) {

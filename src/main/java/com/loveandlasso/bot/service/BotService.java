@@ -6,6 +6,7 @@ import com.loveandlasso.bot.dto.CozeApiResponse;
 import com.loveandlasso.bot.dto.PaymentRequest;
 import com.loveandlasso.bot.dto.PaymentResponse;
 import com.loveandlasso.bot.keyboard.InlineKeyboardFactory;
+import com.loveandlasso.bot.keyboard.MainMenuKeyboard;
 import com.loveandlasso.bot.model.SubscriptionType;
 import com.loveandlasso.bot.model.User;
 import com.loveandlasso.bot.repository.UserRepository;
@@ -19,6 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -280,10 +282,9 @@ public class BotService {
                 user.setSelectedPlan(null);
                 userRepository.save(user);
                 return new BotResponse(
-                        String.format(
-                                MessageTemplates.WELCOME_MESSAGE,
-                                user.getFirstName()),
-                        InlineKeyboardFactory.createTestModeKeyboard()
+                        String.format(MessageTemplates.WELCOME_MESSAGE, user.getFirstName()),
+                        MainMenuKeyboard.create(), // Reply-клавиатура (будет с точкой и удалится)
+                        InlineKeyboardFactory.createTestModeKeyboard() // Inline-клавиатура (останется с приветствием)
                 );
             }
 
@@ -535,21 +536,39 @@ public class BotService {
     public static class BotResponse {
         @Getter
         private final String text;
-
         @Getter
         private final InlineKeyboardMarkup inlineKeyboard;
+        @Getter
+        private final ReplyKeyboardMarkup replyKeyboard;
         private final boolean removeReplyKeyboard;
 
         public BotResponse(String text) {
-            this(text, null, false);
+            this(text, null, null, false);
         }
 
         public BotResponse(String text, InlineKeyboardMarkup inlineKeyboard) {
-            this(text, inlineKeyboard, false);
+            this(text, inlineKeyboard, null, false);
         }
 
         public BotResponse(String text, InlineKeyboardMarkup inlineKeyboard, boolean removeReplyKeyboard) {
-            this.text = text;        this.inlineKeyboard = inlineKeyboard;
+            this(text, inlineKeyboard, null, removeReplyKeyboard);
+        }
+
+        // Новый конструктор для Reply-клавиатуры
+        public BotResponse(String text, ReplyKeyboardMarkup replyKeyboard) {
+            this(text, null, replyKeyboard, false);
+        }
+
+        // Новый конструктор для обеих клавиатур
+        public BotResponse(String text, ReplyKeyboardMarkup replyKeyboard, InlineKeyboardMarkup inlineKeyboard) {
+            this(text, inlineKeyboard, replyKeyboard, false);
+        }
+
+        // Главный конструктор
+        public BotResponse(String text, InlineKeyboardMarkup inlineKeyboard, ReplyKeyboardMarkup replyKeyboard, boolean removeReplyKeyboard) {
+            this.text = text;
+            this.inlineKeyboard = inlineKeyboard;
+            this.replyKeyboard = replyKeyboard;
             this.removeReplyKeyboard = removeReplyKeyboard;
         }
 
@@ -559,6 +578,10 @@ public class BotService {
 
         public boolean hasInlineKeyboard() {
             return inlineKeyboard != null;
+        }
+
+        public boolean hasReplyKeyboard() {
+            return replyKeyboard != null;
         }
     }
 
