@@ -15,6 +15,7 @@ import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
@@ -24,7 +25,9 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMar
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.*;
 
 import static com.loveandlasso.bot.constant.BotConstants.*;
 import static com.loveandlasso.bot.constant.MessageTemplates.*;
@@ -39,6 +42,46 @@ public class BotService {
 
     @Value("${payment.yukassa.returnUrl}")
     private String returnUrl;
+
+    private final Map<Long, MessageBuffer> userMessageBuffers = new ConcurrentHashMap<>();
+
+    private static final long MESSAGE_PART_TIMEOUT = 2000; // 2 секунды
+
+    private static class MessageBuffer {
+        private final StringBuilder content = new StringBuilder();
+        private long lastUpdateTime = System.currentTimeMillis();
+        private boolean isProcessing = false;
+
+        public void addPart(String part) {
+            if (content.length() > 0) {
+                content.append(" ");
+            }
+            content.append(part);
+            lastUpdateTime = System.currentTimeMillis();
+        }
+
+        public String getContent() {
+            return content.toString();
+        }
+
+        public boolean isExpired() {
+            return System.currentTimeMillis() - lastUpdateTime > MESSAGE_PART_TIMEOUT;
+        }
+
+        public void clear() {
+            content.setLength(0);
+            lastUpdateTime = System.currentTimeMillis();
+        }
+
+        public boolean isProcessing() {
+            return isProcessing;
+        }
+
+        public void setProcessing(boolean processing) {
+            this.isProcessing = processing;
+        }
+
+    }
 
     @Autowired
     public BotService(UserRepository userRepository,
@@ -58,87 +101,129 @@ public class BotService {
         }
 
         String messageText = update.getMessage().getText();
+        Long userId = update.getMessage().getFrom().getId();
 
         User user = registerUserIfNeeded(update);
         user.setLastActivity(LocalDateTime.now());
         userRepository.save(user);
 
         if (isMenuButton(messageText)) {
+            clearUserBuffer(userId);
             return handleMenuButton(messageText, user);
         }
 
-        if (BotConstants.DIALOG_SUBSCRIPTION.equals(user.getDialogState()) && !isMenuButton(messageText)) {
-            try {
-                String apiResponse = processRegularMessage(messageText, user);
-                user.setDialogState(BotConstants.DIALOG_MAIN);
-                user.setSelectedPlan(null);
-                user.setLastActivity(LocalDateTime.now());
-                userRepository.save(user);
+        MessageBuffer buffer = userMessageBuffers.computeIfAbsent(userId, k -> new MessageBuffer());
 
-                return new BotResponse(apiResponse);
-
-            } catch (Exception e) {
-                user.setDialogState(BotConstants.DIALOG_MAIN);
-                user.setSelectedPlan(null);
-                user.setLastActivity(LocalDateTime.now());
-                userRepository.save(user);
-                System.err.println("Ошибка при обращении к API: " + e.getMessage());
-                return new BotResponse("⚠️ Извините, произошла ошибка при обработке вашего сообщения. Попробуйте позже.");
-            }
+        if (buffer.isExpired()) {
+            buffer.clear();
         }
+        buffer.addPart(messageText);
 
-        String apiResponse = null;
-        String additionalHint = "";
-
-        String currentState = user.getDialogState();
-        if (currentState != null) {
-            switch (currentState) {
-                case BotConstants.DIALOG_SUBSCRIPTION ->
-                        additionalHint = "\n\n📝 <b>Подсказка:</b> Выберите подписку из меню выше или продолжайте общение с ботом.";
-                case BotConstants.DIALOG_PLAN_DETAILS -> {
-                    if ("test".equals(user.getSelectedPlan())) {
-                        additionalHint = "\n\n📝 <b>Подсказка:</b> Выберите 'Активировать' для подключения тестового тарифа, если Вы им еще не воспользовались";
-                    } else {
-                        additionalHint = "\n\n📝 <b>Подсказка:</b> Для оформления подписки нажмите '💰 Оплатить'.";
-                    }
-                }
-                case BotConstants.DIALOG_PAYMENT ->
-                        additionalHint = "\n\n💳 **Информация:** Если у вас есть вопросы по оплате, обращайтесь в поддержку.";
-                case BotConstants.DIALOG_AWAITING_MESSAGE -> {
-                    user.setDialogState(BotConstants.DIALOG_MAIN);
-                    userRepository.save(user);
-                }
-                default -> {
-                }
-                // Для главного меню и неизвестных состояний - обычная обработка
-            }
+        if (buffer.isProcessing()) {
+            return new BotResponse("⏳ Обрабатываю ваше сообщение...");
         }
 
         try {
-            apiResponse = processRegularMessage(messageText, user);
-        } catch (Exception e) {
-
-            return new BotResponse("⚠️ Извините, произошла ошибка при обработке вашего сообщения. Попробуйте позже.");
+            Thread.sleep(MESSAGE_PART_TIMEOUT);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
 
-        String finalResponse = "";
-        if (apiResponse != null && !apiResponse.trim().isEmpty()) {
-            finalResponse = apiResponse;
-        } else {
-            finalResponse = "🤖 Получен ваш запрос, но ответ пока не готов.";
-        }
+        String completeMessage = buffer.getContent();
+        buffer.setProcessing(true);
 
-        if (!additionalHint.isEmpty()) {
-            finalResponse += additionalHint;
-        }
+        try {
+            if (BotConstants.DIALOG_SUBSCRIPTION.equals(user.getDialogState()) && !isMenuButton(completeMessage)) {
+                try {
+                    String apiResponse = processRegularMessage(completeMessage, user);
 
-        return new BotResponse(finalResponse);
+                    user.setDialogState(BotConstants.DIALOG_MAIN);
+                    user.setSelectedPlan(null);
+                    user.setLastActivity(LocalDateTime.now());
+                    userRepository.save(user);
+
+                    return new BotResponse(apiResponse);
+
+                } catch (Exception e) {
+
+                    user.setDialogState(BotConstants.DIALOG_MAIN);
+                    user.setSelectedPlan(null);
+                    user.setLastActivity(LocalDateTime.now());
+                    userRepository.save(user);
+                    return new BotResponse("⚠️ Извините, произошла ошибка при обработке вашего сообщения. Попробуйте позже.");
+                }
+            }
+
+            String apiResponse = null;
+            String additionalHint = "";
+
+            String currentState = user.getDialogState();
+            if (currentState != null) {
+                switch (currentState) {
+                    case BotConstants.DIALOG_SUBSCRIPTION -> {
+                        additionalHint = "\n\n📝 <b>Подсказка:</b> Выберите подписку из меню выше или продолжайте общение с ботом.";
+
+                        // Определяем, какую клавиатуру показать в зависимости от выбранного плана
+                        InlineKeyboardMarkup selectedKeyboard;
+                        if ("test".equals(user.getSelectedPlan())) {
+                            selectedKeyboard = InlineKeyboardFactory.createNavigationWithPaymentForFreeKeyboard();
+                        } else {
+                            selectedKeyboard = InlineKeyboardFactory.createNavigationWithPaymentKeyboard();
+                        }
+
+                        return new BotResponse(
+                                "\uD83D\uDC49 <b>Выберите тариф, для этого используйте свайпы! ⬅️ ➡️</b>\n\n" +
+                                        getPlanDetailsMessage(user.getSelectedPlan() != null ? user.getSelectedPlan() : "test"),
+                                selectedKeyboard
+                        );
+                    }
+                    case BotConstants.DIALOG_PLAN_DETAILS -> {
+                        if ("test".equals(user.getSelectedPlan())) {
+                            additionalHint = "\n\n📝 <b>Подсказка:</b> Выберите 'Активировать' для подключения тестового тарифа, если Вы им еще не воспользовались";
+                        } else {
+                            additionalHint = "\n\n📝 <b>Подсказка:</b> Для оформления подписки нажмите '💰 Оплатить'.";
+                        }
+                    }
+                    case BotConstants.DIALOG_PAYMENT ->
+                            additionalHint = "\n\n💳 **Информация:** Если у вас есть вопросы по оплате, обращайтесь в поддержку.";
+                    case BotConstants.DIALOG_AWAITING_MESSAGE -> {
+                        user.setDialogState(BotConstants.DIALOG_MAIN);
+                        userRepository.save(user);
+                    }
+                    default -> {
+                    }
+                }
+            }
+
+            try {
+                apiResponse = processRegularMessage(completeMessage, user);
+            } catch (Exception e) {
+                return new BotResponse("⚠️ Извините, произошла ошибка при обработке вашего сообщения. Попробуйте позже.");
+            }
+
+            String finalResponse = "";
+            if (apiResponse != null && !apiResponse.trim().isEmpty()) {
+                finalResponse = apiResponse;
+            } else {
+                finalResponse = "🤖 Получен ваш запрос, но ответ пока не готов.";
+            }
+
+            if (!additionalHint.isEmpty()) {
+                finalResponse += additionalHint;
+            }
+
+            return new BotResponse(finalResponse);
+
+        } finally {
+            clearUserBuffer(userId);
+        }
     }
 
     public BotResponse processCallbackQuery(@NotNull CallbackQuery callbackQuery) {
         String callbackData = callbackQuery.getData();
         User user = getUserFromCallback(callbackQuery);
 
+        clearUserBuffer(callbackQuery.getFrom().getId());
         user.setLastActivity(LocalDateTime.now());
         userRepository.save(user);
 
@@ -157,23 +242,14 @@ public class BotService {
 
             try {
                 String presetMessage = "Привет! Ты кто и что делаешь?";
-                CozeApiResponse cozeResponse = cozeApiService.sendRequest(presetMessage, user);
-                boolean successful = cozeApiService.isValidResponse(cozeResponse);
-                Integer tokenCount = successful && cozeResponse.getUsage() != null
-                        ? cozeResponse.getUsage().getTotalTokens()
-                        : null;
-
-                subscriptionService.logUsage(user, presetMessage, null, successful, tokenCount);
+                String apiResponse = processRegularMessage(presetMessage, user);
 
                 user.setAwaitingResponse(false);
                 user.setDialogState(BotConstants.DIALOG_MAIN);
                 userRepository.save(user);
 
-                if (!successful) {
-                    return new BotResponse(MessageTemplates.API_ERROR);
-                }
+                return new BotResponse(apiResponse);
 
-                return new BotResponse(cozeApiService.extractResponseText(cozeResponse));
             } catch (Exception e) {
                 user.setAwaitingResponse(false);
                 userRepository.save(user);
@@ -187,42 +263,39 @@ public class BotService {
             user.setSelectedPlan(prevPlan);
             userRepository.save(user);
 
-            if (prevPlan.equals("test")) {
-                return new BotResponse(
-                        TARIFF_INFO +
-                                getPlanDetailsMessage(prevPlan),
-                        InlineKeyboardFactory.createNavigationWithPaymentForFreeKeyboard()
-                );
+            InlineKeyboardMarkup selectedKeyboard;
+            if ("test".equals(user.getSelectedPlan())) {
+                selectedKeyboard = InlineKeyboardFactory.createNavigationWithPaymentForFreeKeyboard();
             } else {
-                return new BotResponse(
-                        TARIFF_INFO +
-                                getPlanDetailsMessage(prevPlan),
-                        InlineKeyboardFactory.createNavigationWithPaymentKeyboard()
-                );
+                selectedKeyboard = InlineKeyboardFactory.createNavigationWithPaymentKeyboard();
             }
 
-
+            return new BotResponse(
+                    TARIFF_INFO +
+                            getPlanDetailsMessage(prevPlan),
+                    selectedKeyboard
+            );
         }
 
+        // Обработка навигации "Вперед"
         if (InlineKeyboardFactory.CALLBACK_NEXT.equals(callbackData)) {
             String currentPlan = user.getSelectedPlan();
             String nextPlan = getNextPlan(currentPlan);
             user.setSelectedPlan(nextPlan);
             userRepository.save(user);
 
-            if (nextPlan.equals("test")) {
-                return new BotResponse(
-                        TARIFF_INFO +
-                                getPlanDetailsMessage(nextPlan),
-                        InlineKeyboardFactory.createNavigationWithPaymentForFreeKeyboard()
-                );
+            InlineKeyboardMarkup selectedKeyboard;
+            if ("test".equals(user.getSelectedPlan())) {
+                selectedKeyboard = InlineKeyboardFactory.createNavigationWithPaymentForFreeKeyboard();
             } else {
-                return new BotResponse(
-                        TARIFF_INFO +
-                                getPlanDetailsMessage(nextPlan),
-                        InlineKeyboardFactory.createNavigationWithPaymentKeyboard()
-                );
+                selectedKeyboard = InlineKeyboardFactory.createNavigationWithPaymentKeyboard();
             }
+
+            return new BotResponse(
+                    TARIFF_INFO +
+                            getPlanDetailsMessage(nextPlan),
+                    selectedKeyboard
+            );
         }
 
         if (InlineKeyboardFactory.CALLBACK_PAY.equals(callbackData)) {
@@ -254,7 +327,10 @@ public class BotService {
                 ? cozeResponse.getUsage().getTotalTokens()
                 : null;
 
-        subscriptionService.logUsage(user, message, null, successful, tokenCount);
+        String messageForLogging = message.length() > 1000 ?
+                message.substring(0, 997) + "..." : message;
+
+        subscriptionService.logUsage(user, messageForLogging, null, successful, tokenCount);
 
         user.setAwaitingResponse(false);
         userRepository.save(user);
@@ -266,8 +342,16 @@ public class BotService {
         return cozeApiService.extractResponseText(cozeResponse);
     }
 
-    private boolean isMenuButton(@NotNull String messageText) {
+    private void clearUserBuffer(Long userId) {
+        userMessageBuffers.remove(userId);
+    }
 
+    @Scheduled(fixedRate = 30000) // Каждые 30 секунд
+    public void cleanupExpiredBuffers() {
+        userMessageBuffers.entrySet().removeIf(entry -> entry.getValue().isExpired());
+    }
+
+    private boolean isMenuButton(@NotNull String messageText) {
         return  messageText.equals("ℹ️ Инструкция") ||
                 messageText.equals("💼 Подписные тарифы") ||
                 messageText.contains("\uD83D\uDD27 Тех.поддержка") ||
@@ -283,8 +367,8 @@ public class BotService {
                 userRepository.save(user);
                 return new BotResponse(
                         String.format(MessageTemplates.WELCOME_MESSAGE, user.getFirstName()),
-                        MainMenuKeyboard.create(), // Reply-клавиатура (будет с точкой и удалится)
-                        InlineKeyboardFactory.createTestModeKeyboard() // Inline-клавиатура (останется с приветствием)
+                        MainMenuKeyboard.create(),
+                        InlineKeyboardFactory.createTestModeKeyboard()
                 );
             }
 
@@ -293,22 +377,19 @@ public class BotService {
             }
             case "💼 Подписные тарифы" -> {
                 user.setDialogState(BotConstants.DIALOG_SUBSCRIPTION);
-                user.setSelectedPlan("test"); // Устанавливаем начальный выбранный план как "test"
+                user.setSelectedPlan("test");
                 userRepository.save(user);
 
                 return new BotResponse(
-                        "\uD83D\uDC49 <b>Выберите тариф, для этого используйте свайпы! ⬅️ ➡️</b>\n\n" + MessageTemplates.FREE_INFO,
+                        TARIFF_INFO + MessageTemplates.FREE_INFO,
                         InlineKeyboardFactory.createNavigationWithPaymentForFreeKeyboard(),
                         true
                 );
             }
             case "\uD83D\uDD27 Тех.поддержка", "?" -> {
                 return new BotResponse(
-                        String.format(
-                                HELP_MESSAGE,
-                                user.getFirstName()),
+                        String.format(HELP_MESSAGE, user.getFirstName()),
                         InlineKeyboardFactory.createHelpKeyboard());
-
             }
             case "📞 Связаться" -> {
                 return new BotResponse("Для связи обратитесь к @Estreman");
@@ -320,7 +401,6 @@ public class BotService {
                 return new BotResponse(activateTestPlan(user));
             }
 
-            // Обработка выбора тарифов - переход к детальному описанию
             default -> throw new IllegalStateException("Unexpected value: " + user.getDialogState());
         }
     }
@@ -385,7 +465,6 @@ public class BotService {
             return MessageTemplates.TEST_ACTIVATE;
 
         } catch (Exception e) {
-
             return TEST_ACTIVATE_ERROR;
         }
     }
@@ -554,17 +633,10 @@ public class BotService {
             this(text, inlineKeyboard, null, removeReplyKeyboard);
         }
 
-        // Новый конструктор для Reply-клавиатуры
-        public BotResponse(String text, ReplyKeyboardMarkup replyKeyboard) {
-            this(text, null, replyKeyboard, false);
-        }
-
-        // Новый конструктор для обеих клавиатур
         public BotResponse(String text, ReplyKeyboardMarkup replyKeyboard, InlineKeyboardMarkup inlineKeyboard) {
             this(text, inlineKeyboard, replyKeyboard, false);
         }
 
-        // Главный конструктор
         public BotResponse(String text, InlineKeyboardMarkup inlineKeyboard, ReplyKeyboardMarkup replyKeyboard, boolean removeReplyKeyboard) {
             this.text = text;
             this.inlineKeyboard = inlineKeyboard;
@@ -584,5 +656,4 @@ public class BotService {
             return replyKeyboard != null;
         }
     }
-
 }

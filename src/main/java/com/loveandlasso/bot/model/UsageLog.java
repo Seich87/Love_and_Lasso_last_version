@@ -37,6 +37,6 @@ public class UsageLog {
     @Column(name = "token_count")
     private Integer tokenCount;
 
-    @Column(name = "user_query", length = 1000)
+    @Column(name = "user_query", length = 10000)
     private String userQuery;
 }

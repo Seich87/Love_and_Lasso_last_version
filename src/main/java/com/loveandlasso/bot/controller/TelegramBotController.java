@@ -26,8 +26,7 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMar
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardRemove;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 
 import static com.loveandlasso.bot.constant.MessageTemplates.ERROR_MESSAGE;
 import static com.loveandlasso.bot.constant.MessageTemplates.ERROR_SEND_MESSAGE;
@@ -52,7 +51,7 @@ public class TelegramBotController extends TelegramLongPollingBot {
         this.botConfig = botConfig;
         this.userRepository = userRepository;
 
-        this.executorService = Executors.newFixedThreadPool(10);
+        this.executorService = Executors.newFixedThreadPool(15);
     }
 
     @Override
@@ -60,16 +59,17 @@ public class TelegramBotController extends TelegramLongPollingBot {
         return botConfig.getUsername();
     }
 
+    @Override
     public void onUpdateReceived(Update update) {
         executorService.execute(() -> {
             try {
                 if (update.hasMessage() && update.getMessage().hasText()) {
                     processMessage(update);
-
                 } else if (update.hasCallbackQuery()) {
                     processCallbackQuery(update);
                 }
             } catch (Exception e) {
+                log.error("Ошибка при обработке обновления: {}", e.getMessage(), e);
                 sendErrorMessage(update);
             }
         });
@@ -114,7 +114,7 @@ public class TelegramBotController extends TelegramLongPollingBot {
             sendResponse(chatId.toString(), response, messageText, user);
 
         } catch (Exception e) {
-
+            log.error("Ошибка при обработке сообщения: {}", e.getMessage(), e);
             try {
                 SendMessage errorMessage = new SendMessage();
                 errorMessage.setChatId(chatId.toString());
@@ -124,7 +124,6 @@ public class TelegramBotController extends TelegramLongPollingBot {
             }
         }
     }
-
 
     private void processCallbackQuery(@NotNull Update update) {
         CallbackQuery callbackQuery = update.getCallbackQuery();
@@ -186,6 +185,7 @@ public class TelegramBotController extends TelegramLongPollingBot {
             answerCallbackQuery(callbackQuery.getId());
 
         } catch (Exception e) {
+            log.error("Ошибка при обработке callback: {}", e.getMessage(), e);
             try {
                 answerCallbackQuery(callbackQuery.getId());
 
@@ -198,7 +198,6 @@ public class TelegramBotController extends TelegramLongPollingBot {
             }
         }
     }
-
 
     private void sendResponse(String chatId, @NotNull BotService.BotResponse response, String originalMessage, User user) {
         String text = response.getText();
@@ -229,6 +228,10 @@ public class TelegramBotController extends TelegramLongPollingBot {
                         // Игнорируем ошибки отправки
                     }
                 }
+
+                // Отправляем Reply-клавиатуру для длинных сообщений
+                sendReplyKeyboardIfNeeded(chatId, response);
+
             } else {
                 // Отправляем основное сообщение с inline-клавиатурой (если есть)
                 ReplyKeyboard mainReplyMarkup = response.hasInlineKeyboard() ? response.getInlineKeyboard() : null;
@@ -238,27 +241,9 @@ public class TelegramBotController extends TelegramLongPollingBot {
                 } catch (TelegramApiException ignored) {
                     // Игнорируем ошибки отправки
                 }
-            }
 
-            // Если есть Reply-клавиатура, отправляем её отдельным сообщением с точкой и удаляем
-            if (response.hasReplyKeyboard()) {
-                SendMessage replyMessage = new SendMessage();
-                replyMessage.setChatId(chatId);
-                replyMessage.setText("\n\nМеню для навигации ⬇️");
-                replyMessage.setReplyMarkup(response.getReplyKeyboard());
-
-                // Устанавливаем стандартные настройки для Reply-клавиатуры
-                if (response.getReplyKeyboard() instanceof ReplyKeyboardMarkup) {
-                    ((ReplyKeyboardMarkup) response.getReplyKeyboard()).setOneTimeKeyboard(false);
-                }
-
-                try {
-                    // Отправляем сообщение с Reply-клавиатурой
-                    execute(replyMessage);
-
-                } catch (TelegramApiException ignored) {
-
-                }
+                // Отправляем Reply-клавиатуру для обычных сообщений
+                sendReplyKeyboardIfNeeded(chatId, response);
             }
         } else {
             // Если нет контента, определяем клавиатуру по старой логике
@@ -286,6 +271,29 @@ public class TelegramBotController extends TelegramLongPollingBot {
                 } catch (TelegramApiException ignored) {
                     // Игнорируем ошибки отправки
                 }
+            }
+        }
+    }
+
+    /**
+     * Отправляет Reply-клавиатуру отдельным сообщением, если она есть в ответе
+     */
+    private void sendReplyKeyboardIfNeeded(String chatId, @NotNull BotService.BotResponse response) {
+        if (response.hasReplyKeyboard()) {
+            SendMessage replyMessage = new SendMessage();
+            replyMessage.setChatId(chatId);
+            replyMessage.setText("\n\nМеню для навигации ⬇️");
+            replyMessage.setReplyMarkup(response.getReplyKeyboard());
+
+            // Устанавливаем стандартные настройки для Reply-клавиатуры
+            if (response.getReplyKeyboard() instanceof ReplyKeyboardMarkup) {
+                ((ReplyKeyboardMarkup) response.getReplyKeyboard()).setOneTimeKeyboard(false);
+            }
+
+            try {
+                execute(replyMessage);
+            } catch (TelegramApiException ignored) {
+                // Игнорируем ошибки отправки
             }
         }
     }
@@ -370,7 +378,7 @@ public class TelegramBotController extends TelegramLongPollingBot {
     }
 
     @NotNull
-    private ReplyKeyboardMarkup determineKeyboard(String originalMessage, String responseText,User user) {
+    private ReplyKeyboardMarkup determineKeyboard(String originalMessage, String responseText, User user) {
 
         if (user != null) {
             user = userRepository.findByTelegramId(user.getTelegramId()).orElse(user);

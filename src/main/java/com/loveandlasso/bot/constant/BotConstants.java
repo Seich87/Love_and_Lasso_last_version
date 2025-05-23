@@ -36,5 +36,8 @@ public class BotConstants {
 
     public static final int SUBSCRIPTION_MONTHLY_DAYS = 30;
 
-    public static final int MAX_MESSAGE_LENGTH = 10096;
+    public static final int MAX_MESSAGE_LENGTH = 4096; // Лимит Telegram Bot API
+    public static final int COZE_API_MAX_MESSAGE_LENGTH = 5000; // Было 8000
+    public static final int COZE_API_SAFE_LENGTH = 4100; // Было 7500
+
 }

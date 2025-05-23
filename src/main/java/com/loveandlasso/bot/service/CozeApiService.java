@@ -3,11 +3,13 @@ package com.loveandlasso.bot.service;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.loveandlasso.bot.constant.BotConstants;
 import com.loveandlasso.bot.dto.CozeApiResponse;
 import com.loveandlasso.bot.model.User;
 import org.jetbrains.annotations.NotNull;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
@@ -31,15 +33,18 @@ public class CozeApiService {
     @Value("${coze.bot.id}")
     private String botId;
 
-    @Value("${coze.api.timeout:30000}")
-    private int timeout;
-
     @Autowired
     public CozeApiService(RestTemplate restTemplate) {
         this.restTemplate = restTemplate;
     }
 
     public CozeApiResponse sendRequest(String query, @NotNull User user) {
+        if (query != null && query.length() > BotConstants.COZE_API_SAFE_LENGTH) {
+            query = query.substring(0, BotConstants.COZE_API_SAFE_LENGTH);
+        }
+
+        String finalQuery = query != null ? query.trim() : "Привет!";
+
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         headers.setAccept(List.of(MediaType.APPLICATION_JSON));
@@ -53,7 +58,7 @@ public class CozeApiService {
 
         Map<String, Object> message = new HashMap<>();
         message.put("role", "user");
-        message.put("content", query);
+        message.put("content", finalQuery);
         message.put("content_type", "text");
 
         List<Map<String, Object>> additionalMessages = new ArrayList<>();
@@ -71,7 +76,6 @@ public class CozeApiService {
             );
 
             JsonNode jsonResponse = responseEntity.getBody();
-            System.out.println("JSON response: " + jsonResponse);
 
             ObjectMapper objectMapper = new ObjectMapper();
             objectMapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
@@ -111,11 +115,13 @@ public class CozeApiService {
 
                 String statusUrl = apiUrl + "/v3/chat/retrieve?conversation_id=" + conversationId + "&chat_id=" + chatId;
 
-                ResponseEntity<Map> responseEntity = restTemplate.exchange(
+                ParameterizedTypeReference<Map<String, Object>> typeRef = new ParameterizedTypeReference<Map<String, Object>>() {};
+
+                ResponseEntity<Map<String, Object>> responseEntity = restTemplate.exchange(
                         statusUrl,
                         HttpMethod.GET,
                         entity,
-                        Map.class
+                        typeRef
                 );
 
                 Map<String, Object> rawResponse = responseEntity.getBody();
@@ -133,14 +139,13 @@ public class CozeApiService {
                     } else if ("failed".equals(status)) {
                         return createErrorResponse("Не удалось обработать запрос");
                     }
-                    // Если статус все еще "in_progress", продолжаем ожидание
                 }
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
-                System.err.println("Error polling for completion: " + e.getMessage());
+                // Игнорируем ошибки
             }
         }
 
@@ -157,11 +162,13 @@ public class CozeApiService {
 
             String messagesUrl = apiUrl + "/v3/chat/message/list?conversation_id=" + conversationId + "&chat_id=" + chatId;
 
-            ResponseEntity<Map> responseEntity = restTemplate.exchange(
+            ParameterizedTypeReference<Map<String, Object>> typeRef = new ParameterizedTypeReference<Map<String, Object>>() {};
+
+            ResponseEntity<Map<String, Object>> responseEntity = restTemplate.exchange(
                     messagesUrl,
                     HttpMethod.GET,
                     entity,
-                    Map.class
+                    typeRef
             );
 
             String botResponseText = extractBotResponseFromMessages(responseEntity.getBody());
@@ -179,25 +186,31 @@ public class CozeApiService {
     }
 
     @NotNull
+    @SuppressWarnings("unchecked")
     private String extractBotResponseFromMessages(Map<String, Object> messagesResponse) {
         try {
             if (messagesResponse != null && messagesResponse.containsKey("data")) {
-                List<Map<String, Object>> messages = (List<Map<String, Object>>) messagesResponse.get("data");
+                Object dataObject = messagesResponse.get("data");
 
-                for (Map<String, Object> message : messages) {
-                    String role = (String) message.get("role");
-                    String type = (String) message.get("type");
+                if (dataObject instanceof List<?> dataList) {
+                    for (Object messageObj : dataList) {
+                        if (messageObj instanceof Map<?, ?> messageMap) {
+                            Map<String, Object> message = (Map<String, Object>) messageMap;
+                            String role = (String) message.get("role");
+                            String type = (String) message.get("type");
 
-                    if ("assistant".equals(role) && "answer".equals(type)) {
-                        String content = (String) message.get("content");
-                        if (content != null && !content.trim().isEmpty()) {
-                            return content;
+                            if ("assistant".equals(role) && "answer".equals(type)) {
+                                String content = (String) message.get("content");
+                                if (content != null && !content.trim().isEmpty()) {
+                                    return content;
+                                }
+                            }
                         }
                     }
                 }
             }
         } catch (Exception e) {
-            System.err.println("Error extracting bot response: " + e.getMessage());
+            // Игнорируем ошибки
         }
 
         return "Ответ получен, но содержимое не удалось извлечь.";
@@ -239,12 +252,6 @@ public class CozeApiService {
             return false;
         }
 
-        boolean isValid = response.getCode() != null && response.getCode() == 0;
-
-        if (!isValid) {
-            System.err.println("Invalid response - code: " + response.getCode() + ", msg: " + response.getMsg());
-        }
-
-        return isValid;
+        return response.getCode() != null && response.getCode() == 0;
     }
 }
