@@ -4,9 +4,12 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.loveandlasso.bot.constant.BotConstants;
+import com.loveandlasso.bot.controller.TelegramBotController;
 import com.loveandlasso.bot.dto.CozeApiResponse;
 import com.loveandlasso.bot.model.User;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
@@ -23,6 +26,7 @@ import java.util.*;
 public class CozeApiService {
 
     private final RestTemplate restTemplate;
+    private static final Logger log = LoggerFactory.getLogger(TelegramBotController.class);
 
     @Value("${coze.api.url}")
     private String apiUrl;
@@ -39,11 +43,12 @@ public class CozeApiService {
     }
 
     public CozeApiResponse sendRequest(String query, @NotNull User user) {
-        if (query != null && query.length() > BotConstants.COZE_API_SAFE_LENGTH) {
-            query = query.substring(0, BotConstants.COZE_API_SAFE_LENGTH);
-        }
 
         String finalQuery = query != null ? query.trim() : "Привет!";
+
+        log.info("🚀 Sending to Coze API - Length: {}", finalQuery.length());
+        log.debug("🚀 Content: [{}]", finalQuery.substring(0, Math.min(finalQuery.length(), 500)) + "...");
+
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -68,6 +73,8 @@ public class CozeApiService {
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestMap, headers);
 
         try {
+            log.info("📡 Making HTTP request to Coze API...");
+
             ResponseEntity<JsonNode> responseEntity = restTemplate.exchange(
                     apiUrl + "/v3/chat",
                     HttpMethod.POST,
@@ -75,7 +82,10 @@ public class CozeApiService {
                     JsonNode.class
             );
 
+            log.info("✅ Received HTTP response: status={}", responseEntity.getStatusCode());
+
             JsonNode jsonResponse = responseEntity.getBody();
+            log.info("📝 Response body: {}", jsonResponse);
 
             ObjectMapper objectMapper = new ObjectMapper();
             objectMapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
@@ -92,10 +102,13 @@ public class CozeApiService {
             return response;
 
         } catch (HttpClientErrorException | HttpServerErrorException e) {
+            log.error("❌ HTTP Error: status={}, body={}", e.getStatusCode(), e.getResponseBodyAsString());
             return createErrorResponse("Ошибка HTTP: " + e.getStatusCode());
         } catch (ResourceAccessException e) {
+            log.error("❌ Connection Error: {}", e.getMessage());
             return createErrorResponse("Ошибка соединения");
         } catch (Exception e) {
+            log.error("❌ Unexpected Error: {}", e.getMessage(), e);
             return createErrorResponse("Неожиданная ошибка: " + e.getMessage());
         }
     }

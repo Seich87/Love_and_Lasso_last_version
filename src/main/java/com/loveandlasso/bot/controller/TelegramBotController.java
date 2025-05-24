@@ -422,4 +422,19 @@ public class TelegramBotController extends TelegramLongPollingBot {
             log.error("Ошибка при отправке сообщения об ошибке: {}", e.getMessage(), e);
         }
     }
+
+    public void sendSimpleMessage(Long userId, String text) {
+        try {
+            SendMessage message = new SendMessage();
+            message.setChatId(userId.toString());
+            message.setText(text);
+            message.setParseMode("HTML");
+
+            execute(message);
+            log.info("✅ Sent response to user {}: length={}", userId, text.length());
+
+        } catch (TelegramApiException e) {
+            log.error("❌ Failed to send message to user {}: {}", userId, e.getMessage());
+        }
+    }
 }

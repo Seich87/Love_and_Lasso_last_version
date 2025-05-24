@@ -2,6 +2,8 @@ package com.loveandlasso.bot.service;
 
 import com.loveandlasso.bot.constant.BotConstants;
 import com.loveandlasso.bot.constant.MessageTemplates;
+import com.loveandlasso.bot.controller.ApplicationContextProvider;
+import com.loveandlasso.bot.controller.TelegramBotController;
 import com.loveandlasso.bot.dto.CozeApiResponse;
 import com.loveandlasso.bot.dto.PaymentRequest;
 import com.loveandlasso.bot.dto.PaymentResponse;
@@ -10,11 +12,15 @@ import com.loveandlasso.bot.keyboard.MainMenuKeyboard;
 import com.loveandlasso.bot.model.SubscriptionType;
 import com.loveandlasso.bot.model.User;
 import com.loveandlasso.bot.repository.UserRepository;
+import jakarta.annotation.PreDestroy;
 import lombok.Getter;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationContext;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -25,9 +31,11 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMar
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.*;
+import java.util.function.Consumer;
 
 import static com.loveandlasso.bot.constant.BotConstants.*;
 import static com.loveandlasso.bot.constant.MessageTemplates.*;
@@ -43,44 +51,133 @@ public class BotService {
     @Value("${payment.yukassa.returnUrl}")
     private String returnUrl;
 
-    private final Map<Long, MessageBuffer> userMessageBuffers = new ConcurrentHashMap<>();
+    // Система сборки разбитых сообщений
+    private final Map<Long, MessageAssembler> messageAssemblers = new ConcurrentHashMap<>();
+    private static final Logger log = LoggerFactory.getLogger(TelegramBotController.class);
+    private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(5);
 
-    private static final long MESSAGE_PART_TIMEOUT = 2000; // 2 секунды
+    private static final long PART_WAIT_TIMEOUT = 2000; // 2 секунды между частями
+    private static final long MAX_ASSEMBLY_TIME = 60000; // 30 секунд максимум на сборку
 
-    private static class MessageBuffer {
-        private final StringBuilder content = new StringBuilder();
-        private long lastUpdateTime = System.currentTimeMillis();
-        private boolean isProcessing = false;
+    private static class MessageAssembler {
+        private final StringBuilder fullMessage = new StringBuilder();
+        private final Long userId;
+        private final Consumer<MessageAssembler> completeHandler;
+        private ScheduledFuture<?> processingTask;
+        private final long assemblyStartTime;
+        private long lastPartTime;
+        private int partsCount = 0;
+        private boolean isAssembling = true;
 
-        public void addPart(String part) {
-            if (content.length() > 0) {
-                content.append(" ");
+        MessageAssembler(Long userId, Consumer<MessageAssembler> completeHandler) {
+            this.userId = userId;
+            this.completeHandler = completeHandler;
+            this.assemblyStartTime = System.currentTimeMillis();
+            this.lastPartTime = assemblyStartTime;
+        }
+
+        synchronized void addPart(String part) {
+            if (!isAssembling) {
+                log.warn("Ignoring part - assembly already completed for user {}", userId);
+                return;
             }
-            content.append(part);
-            lastUpdateTime = System.currentTimeMillis();
+
+            long now = System.currentTimeMillis();
+            partsCount++;
+
+            // Добавляем часть к полному сообщению
+            if (fullMessage.length() > 0) {
+                fullMessage.append(" "); // Пробел между частями
+            }
+            fullMessage.append(part.trim());
+            lastPartTime = now;
+
+            log.info("📥 Part #{} received for user {}: length={}, total_length={}",
+                    partsCount, userId, part.length(), fullMessage.length());
+            log.debug("Part content: [{}]", part);
+
+            // Отменяем предыдущую задачу обработки
+            if (processingTask != null) {
+                processingTask.cancel(false);
+            }
+
+            // Планируем обработку полного сообщения
+            long delay = calculateDelay(now);
+            processingTask = scheduler.schedule(this::tryComplete, delay, TimeUnit.MILLISECONDS);
+
+            log.info("⏰ Scheduled completion check for user {} in {}ms", userId, delay);
+        }
+        private long calculateDelay(long now) {
+            long assemblyDuration = now - assemblyStartTime;
+
+            // Если сборка длится слишком долго - завершаем принудительно
+            if (assemblyDuration > MAX_ASSEMBLY_TIME) {
+                log.warn("⚠️ Force completing due to max assembly time for user {}", userId);
+                return 100;
+            }
+
+            // Если получили много частей - короткая задержка
+            if (partsCount > 3) {
+                return 1500;
+            }
+
+            // Обычная задержка
+            return PART_WAIT_TIMEOUT;
         }
 
-        public String getContent() {
-            return content.toString();
+        private void tryComplete() {
+            long now = System.currentTimeMillis();
+            long timeSinceLastPart = now - lastPartTime;
+            long sessionDuration = now - assemblyStartTime; // Вычисляем на лету
+
+            log.info("🔍 tryComplete: user={}, sessionDuration={}ms, parts={}, length={}",
+                    userId, sessionDuration, partsCount, fullMessage.length());
+
+            // ДОБАВЛЯЕМ принудительное завершение
+            boolean forceByTime = sessionDuration > 10000; // 10 секунд
+            boolean forceByParts = partsCount >= 4; // 4 или больше частей
+            boolean normalComplete = timeSinceLastPart >= PART_WAIT_TIMEOUT - 100;
+
+            if (forceByTime || forceByParts || normalComplete) {
+                if (forceByTime) {
+                    log.warn("⚡ FORCE completing by time for user {}", userId);
+                } else if (forceByParts) {
+                    log.warn("⚡ FORCE completing by parts count for user {}", userId);
+                } else {
+                    log.info("✅ Normal completion for user {}", userId);
+                }
+
+                log.info("✅ Triggering completion for user {}: parts={}, length={}",
+                        userId, partsCount, fullMessage.length());
+                completeHandler.accept(this);
+            } else {
+                log.info("⏳ Not ready yet for user {}, need {}ms more",
+                        userId, (PART_WAIT_TIMEOUT - 100) - timeSinceLastPart);
+            }
         }
 
-        public boolean isExpired() {
-            return System.currentTimeMillis() - lastUpdateTime > MESSAGE_PART_TIMEOUT;
+        synchronized String getAssembledMessage() {
+            return fullMessage.toString().trim();
         }
 
-        public void clear() {
-            content.setLength(0);
-            lastUpdateTime = System.currentTimeMillis();
+        synchronized void markCompleted() {
+            isAssembling = false;
+            if (processingTask != null) {
+                processingTask.cancel(false);
+            }
         }
 
-        public boolean isProcessing() {
-            return isProcessing;
+        boolean isAssembling() {
+            return isAssembling;
         }
 
-        public void setProcessing(boolean processing) {
-            this.isProcessing = processing;
+        Long getUserId() {
+            return userId;
         }
 
+        int getPartsCount() {
+            return partsCount;
+        }
     }
 
     @Autowired
@@ -95,7 +192,6 @@ public class BotService {
     }
 
     public BotResponse processMessage(@NotNull Update update) {
-
         if (!update.hasMessage() || !update.getMessage().hasText()) {
             return new BotResponse(MessageTemplates.ERROR_MESSAGE);
         }
@@ -103,119 +199,43 @@ public class BotService {
         String messageText = update.getMessage().getText();
         Long userId = update.getMessage().getFrom().getId();
 
+        log.info("📨 Incoming message from user {}: length={}", userId, messageText.length());
+        log.debug("Message content: [{}]", messageText);
+
         User user = registerUserIfNeeded(update);
         user.setLastActivity(LocalDateTime.now());
         userRepository.save(user);
 
+        // Команды меню обрабатываем немедленно
         if (isMenuButton(messageText)) {
-            clearUserBuffer(userId);
+            log.info("🔘 Menu command detected, clearing assembler for user {}", userId);
+            clearMessageAssembler(userId);
             return handleMenuButton(messageText, user);
         }
 
-        MessageBuffer buffer = userMessageBuffers.computeIfAbsent(userId, k -> new MessageBuffer());
+        // Получаем или создаем сборщик сообщений
+        MessageAssembler assembler = messageAssemblers.computeIfAbsent(userId,
+                k -> {
+                    log.info("🔧 Creating new message assembler for user {}", k);
+                    return new MessageAssembler(k, this::handleAssembledMessage);
+                });
 
-        if (buffer.isExpired()) {
-            buffer.clear();
-        }
-        buffer.addPart(messageText);
-
-        if (buffer.isProcessing()) {
-            return new BotResponse("⏳ Обрабатываю ваше сообщение...");
-        }
-
-        try {
-            Thread.sleep(MESSAGE_PART_TIMEOUT);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        // Проверяем, не завершается ли уже обработка предыдущего сообщения
+        if (!assembler.isAssembling()) {
+            log.info("🔄 Previous assembly completed, creating new assembler for user {}", userId);
+            clearMessageAssembler(userId);
+            assembler = new MessageAssembler(userId, this::handleAssembledMessage);
+            messageAssemblers.put(userId, assembler);
         }
 
-        String completeMessage = buffer.getContent();
-        buffer.setProcessing(true);
+        // Добавляем часть в сборщик
+        assembler.addPart(messageText);
 
-        try {
-            if (BotConstants.DIALOG_SUBSCRIPTION.equals(user.getDialogState()) && !isMenuButton(completeMessage)) {
-                try {
-                    String apiResponse = processRegularMessage(completeMessage, user);
-
-                    user.setDialogState(BotConstants.DIALOG_MAIN);
-                    user.setSelectedPlan(null);
-                    user.setLastActivity(LocalDateTime.now());
-                    userRepository.save(user);
-
-                    return new BotResponse(apiResponse);
-
-                } catch (Exception e) {
-
-                    user.setDialogState(BotConstants.DIALOG_MAIN);
-                    user.setSelectedPlan(null);
-                    user.setLastActivity(LocalDateTime.now());
-                    userRepository.save(user);
-                    return new BotResponse("⚠️ Извините, произошла ошибка при обработке вашего сообщения. Попробуйте позже.");
-                }
-            }
-
-            String apiResponse = null;
-            String additionalHint = "";
-
-            String currentState = user.getDialogState();
-            if (currentState != null) {
-                switch (currentState) {
-                    case BotConstants.DIALOG_SUBSCRIPTION -> {
-                        additionalHint = "\n\n📝 <b>Подсказка:</b> Выберите подписку из меню выше или продолжайте общение с ботом.";
-
-                        // Определяем, какую клавиатуру показать в зависимости от выбранного плана
-                        InlineKeyboardMarkup selectedKeyboard;
-                        if ("test".equals(user.getSelectedPlan())) {
-                            selectedKeyboard = InlineKeyboardFactory.createNavigationWithPaymentForFreeKeyboard();
-                        } else {
-                            selectedKeyboard = InlineKeyboardFactory.createNavigationWithPaymentKeyboard();
-                        }
-
-                        return new BotResponse(
-                                "\uD83D\uDC49 <b>Выберите тариф, для этого используйте свайпы! ⬅️ ➡️</b>\n\n" +
-                                        getPlanDetailsMessage(user.getSelectedPlan() != null ? user.getSelectedPlan() : "test"),
-                                selectedKeyboard
-                        );
-                    }
-                    case BotConstants.DIALOG_PLAN_DETAILS -> {
-                        if ("test".equals(user.getSelectedPlan())) {
-                            additionalHint = "\n\n📝 <b>Подсказка:</b> Выберите 'Активировать' для подключения тестового тарифа, если Вы им еще не воспользовались";
-                        } else {
-                            additionalHint = "\n\n📝 <b>Подсказка:</b> Для оформления подписки нажмите '💰 Оплатить'.";
-                        }
-                    }
-                    case BotConstants.DIALOG_PAYMENT ->
-                            additionalHint = "\n\n💳 **Информация:** Если у вас есть вопросы по оплате, обращайтесь в поддержку.";
-                    case BotConstants.DIALOG_AWAITING_MESSAGE -> {
-                        user.setDialogState(BotConstants.DIALOG_MAIN);
-                        userRepository.save(user);
-                    }
-                    default -> {
-                    }
-                }
-            }
-
-            try {
-                apiResponse = processRegularMessage(completeMessage, user);
-            } catch (Exception e) {
-                return new BotResponse("⚠️ Извините, произошла ошибка при обработке вашего сообщения. Попробуйте позже.");
-            }
-
-            String finalResponse = "";
-            if (apiResponse != null && !apiResponse.trim().isEmpty()) {
-                finalResponse = apiResponse;
-            } else {
-                finalResponse = "🤖 Получен ваш запрос, но ответ пока не готов.";
-            }
-
-            if (!additionalHint.isEmpty()) {
-                finalResponse += additionalHint;
-            }
-
-            return new BotResponse(finalResponse);
-
-        } finally {
-            clearUserBuffer(userId);
+        // Возвращаем подтверждение (пользователь увидит что части получаются)
+        if (assembler.getPartsCount() == 1) {
+            return new BotResponse("📝 Сообщение получено, собираю части...");
+        } else {
+            return new BotResponse(String.format("📝 Получена часть %d, собираю...", assembler.getPartsCount()));
         }
     }
 
@@ -223,19 +243,24 @@ public class BotService {
         String callbackData = callbackQuery.getData();
         User user = getUserFromCallback(callbackQuery);
 
-        clearUserBuffer(callbackQuery.getFrom().getId());
+        // ЕДИНСТВЕННОЕ ИЗМЕНЕНИЕ: заменяем clearUserBuffer на clearMessageAssembler
+        clearMessageAssembler(callbackQuery.getFrom().getId());
+
         user.setLastActivity(LocalDateTime.now());
         userRepository.save(user);
 
         if (InlineKeyboardFactory.CALLBACK_TEST_MODE.equals(callbackData)) {
             return new BotResponse(activateTestPlan(user));
         }
+
         if (InlineKeyboardFactory.CALLBACK_HELP_MODE.equals(callbackData)) {
             return new BotResponse(activateTestPlan(user));
         }
+
         if (InlineKeyboardFactory.CALLBACK_CONTACT.equals(callbackData)) {
             return new BotResponse("Для связи обратитесь к @Estreman");
         }
+
         if (InlineKeyboardFactory.CALLBACK_START_DIALOG.equals(callbackData)) {
             user.setAwaitingResponse(true);
             userRepository.save(user);
@@ -271,8 +296,7 @@ public class BotService {
             }
 
             return new BotResponse(
-                    TARIFF_INFO +
-                            getPlanDetailsMessage(prevPlan),
+                    TARIFF_INFO + getPlanDetailsMessage(prevPlan),
                     selectedKeyboard
             );
         }
@@ -292,8 +316,7 @@ public class BotService {
             }
 
             return new BotResponse(
-                    TARIFF_INFO +
-                            getPlanDetailsMessage(nextPlan),
+                    TARIFF_INFO + getPlanDetailsMessage(nextPlan),
                     selectedKeyboard
             );
         }
@@ -312,15 +335,128 @@ public class BotService {
         return new BotResponse("Неизвестное действие");
     }
 
+    private void handleAssembledMessage(MessageAssembler assembler) {
+        Long userId = assembler.getUserId();
+
+        log.info("🎯 handleAssembledMessage START for user {}", userId);
+
+        try {
+            assembler.markCompleted();
+            String assembledMessage = assembler.getAssembledMessage();
+
+            log.info("🎯 === PROCESSING ASSEMBLED MESSAGE ===");
+            log.info("User: {}", userId);
+            log.info("Parts assembled: {}", assembler.getPartsCount());
+            log.info("Final length: {}", assembledMessage.length());
+            log.info("Assembled content: [{}]", assembledMessage);
+
+            // Получаем пользователя
+            User user = userRepository.findByTelegramId(userId)
+                    .orElseThrow(() -> new RuntimeException("User not found: " + userId));
+
+            log.info("🚀 === SENDING SINGLE REQUEST TO COZE API ===");
+
+            // ОТПРАВЛЯЕМ В COZE API ОДНИМ ЗАПРОСОМ
+            String apiResponse = processRegularMessage(assembledMessage, user);
+
+            log.info("✅ === RECEIVED RESPONSE FROM COZE API ===");
+            log.info("Response length: {}", apiResponse.length());
+
+            // Отправляем ответ пользователю
+            sendResponseToUser(userId, apiResponse);
+
+            log.info("📤 Response sent to user {}", userId);
+
+        } catch (Exception e) {
+            log.error("❌ Error processing assembled message for user {}", userId, e);
+            sendResponseToUser(userId, "⚠️ Извините, произошла ошибка при обработке вашего сообщения.");
+        } finally {
+            log.info("🧹 Clearing assembler for user {}", userId);
+            // Очищаем сборщик
+            clearMessageAssembler(userId);
+        }
+    }
+
+    private void sendResponseToUser(Long userId, String response) {
+        // Здесь пока простая отправка - можно потом улучшить
+        try {
+            // Нужна ссылка на TelegramBotController или можно через события
+            log.info("📤 Sending response to user {}: length={}", userId, response.length());
+
+            // Временное решение - можно улучшить
+            ApplicationContext context = ApplicationContextProvider.getApplicationContext();
+            TelegramBotController botController = context.getBean(TelegramBotController.class);
+            botController.sendSimpleMessage(userId, response);
+
+        } catch (Exception e) {
+            log.error("❌ Failed to send response to user {}", userId, e);
+        }
+    }
+
+    private void clearMessageAssembler(Long userId) {
+        MessageAssembler assembler = messageAssemblers.remove(userId);
+        if (assembler != null) {
+            log.info("🗑️ Cleared message assembler for user {}", userId);
+            assembler.markCompleted();
+        }
+    }
+
+    @Scheduled(fixedRate = 30000) // Каждые 30 секунд
+    public void cleanupExpiredAssemblers() {
+        long now = System.currentTimeMillis();
+        int cleaned = 0;
+
+        Iterator<Map.Entry<Long, MessageAssembler>> iterator = messageAssemblers.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<Long, MessageAssembler> entry = iterator.next();
+            MessageAssembler assembler = entry.getValue();
+
+            // Проверяем, не истекло ли время сборки
+            if (now - assembler.assemblyStartTime > MAX_ASSEMBLY_TIME * 2) {
+                log.info("🧹 Cleaning up expired assembler for user {}", entry.getKey());
+                assembler.markCompleted(); // Останавливаем задачи
+                iterator.remove();
+                cleaned++;
+            }
+        }
+
+        if (cleaned > 0) {
+            log.info("🧹 Cleaned up {} expired message assemblers", cleaned);
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        log.info("🔌 Shutting down message assembly scheduler");
+        scheduler.shutdown();
+        try {
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+
+
+
+
     public String processRegularMessage(String message, User user) {
+        log.info("🔥 processRegularMessage START: message_length={}", message.length());
+
         if (subscriptionService.isDailyLimitExceeded(user)) {
+            log.info("⚠️ Daily limit exceeded for user {}", user.getTelegramId());
             return MessageTemplates.LIMIT_REACHED;
         }
 
         user.setAwaitingResponse(true);
         userRepository.save(user);
 
+        log.info("🚀 Calling cozeApiService.sendRequest");
         CozeApiResponse cozeResponse = cozeApiService.sendRequest(message, user);
+        log.info("✅ Received response from cozeApiService");
 
         boolean successful = cozeApiService.isValidResponse(cozeResponse);
         Integer tokenCount = successful && cozeResponse.getUsage() != null
@@ -340,15 +476,6 @@ public class BotService {
         }
 
         return cozeApiService.extractResponseText(cozeResponse);
-    }
-
-    private void clearUserBuffer(Long userId) {
-        userMessageBuffers.remove(userId);
-    }
-
-    @Scheduled(fixedRate = 30000) // Каждые 30 секунд
-    public void cleanupExpiredBuffers() {
-        userMessageBuffers.entrySet().removeIf(entry -> entry.getValue().isExpired());
     }
 
     private boolean isMenuButton(@NotNull String messageText) {
